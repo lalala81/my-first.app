@@ -1,0 +1,391 @@
+import React, { useState, useEffect, useMemo } from 'react';
+import { initializeApp } from 'firebase/app';
+import { getAuth, signInAnonymously, onAuthStateChanged, signInWithCustomToken } from 'firebase/auth';
+import { getFirestore, collection, addDoc, query, onSnapshot, deleteDoc, doc, Timestamp } from 'firebase/firestore';
+import { Bus, Save, FileText, Download, Trash2, MessageSquare, AlertTriangle, MapPin, CheckCircle, ClipboardCopy } from 'lucide-react';
+
+// --- Firebase Configuration ---
+const firebaseConfig = JSON.parse(__firebase_config);
+const app = initializeApp(firebaseConfig);
+const auth = getAuth(app);
+const db = getFirestore(app);
+const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+
+// --- Components ---
+
+// Notification Banner
+const Notification = ({ message, type, onClose }) => {
+  if (!message) return null;
+  const bgColor = type === 'success' ? 'bg-emerald-100 border-emerald-500 text-emerald-700' : 'bg-red-100 border-red-500 text-red-700';
+  
+  return (
+    <div className={`fixed top-4 right-4 p-4 rounded-md shadow-lg border-l-4 ${bgColor} z-50 flex items-center animate-fade-in-down`}>
+      <span>{message}</span>
+      <button onClick={onClose} className="ml-4 font-bold">×</button>
+    </div>
+  );
+};
+
+export default function ShuttleLogApp() {
+  const [user, setUser] = useState(null);
+  const [logs, setLogs] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [notification, setNotification] = useState({ message: '', type: '' });
+  
+  // Input Form State
+  const [category, setCategory] = useState('customer_voice');
+  const [content, setContent] = useState('');
+  const [date, setDate] = useState(new Date().toISOString().split('T')[0]);
+  
+  // Export Modal State
+  const [showExport, setShowExport] = useState(false);
+  
+  // Delete Confirmation State
+  const [deleteId, setDeleteId] = useState(null);
+
+  // --- Constants ---
+  const CATEGORIES = useMemo(() => [
+    { id: 'customer_voice', label: 'お客様の声', icon: <MessageSquare size={18} />, color: 'text-blue-600 bg-blue-50' },
+    { id: 'safety', label: 'ヒヤリハット・安全', icon: <AlertTriangle size={18} />, color: 'text-red-600 bg-red-50' },
+    { id: 'route', label: 'ルート・道路状況', icon: <MapPin size={18} />, color: 'text-green-600 bg-green-50' },
+    { id: 'operation', label: '運行管理・その他', icon: <CheckCircle size={18} />, color: 'text-gray-600 bg-gray-50' },
+  ], []);
+
+  // --- Auth & Data Fetching ---
+  useEffect(() => {
+    const initAuth = async () => {
+      try {
+        if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
+          await signInWithCustomToken(auth, __initial_auth_token);
+        } else {
+          await signInAnonymously(auth);
+        }
+      } catch (error) {
+        console.error("Auth error:", error);
+      }
+    };
+    initAuth();
+
+    const unsubscribeAuth = onAuthStateChanged(auth, (currentUser) => {
+      setUser(currentUser);
+    });
+    return () => unsubscribeAuth();
+  }, []);
+
+  useEffect(() => {
+    if (!user) return;
+
+    // RULE 2: No complex queries. Fetch all and sort in JS.
+    const q = query(
+      collection(db, 'artifacts', appId, 'public', 'data', 'shuttle_logs')
+    );
+
+    const unsubscribeData = onSnapshot(q, (snapshot) => {
+      const loadedLogs = snapshot.docs.map(doc => {
+        const data = doc.data();
+        const dateStr = typeof data.date === 'string' ? data.date : String(data.date || '');
+        return {
+          id: doc.id,
+          ...data,
+          date: dateStr
+        };
+      });
+
+      loadedLogs.sort((a, b) => {
+        if (a.date !== b.date) {
+          return b.date.localeCompare(a.date);
+        }
+        const timeA = a.createdAt?.seconds || 0;
+        const timeB = b.createdAt?.seconds || 0;
+        return timeB - timeA;
+      });
+
+      setLogs(loadedLogs);
+      setLoading(false);
+    }, (error) => {
+      console.error("Data fetch error:", error);
+      setNotification({ message: "データの読み込みに失敗しました", type: "error" });
+      setLoading(false);
+    });
+
+    return () => unsubscribeData();
+  }, [user]);
+
+  // --- Handlers ---
+
+  const showNotify = (msg, type = 'success') => {
+    setNotification({ message: msg, type });
+    setTimeout(() => setNotification({ message: '', type: '' }), 3000);
+  };
+
+  const handleSave = async (e) => {
+    e.preventDefault();
+    if (!content.trim()) return;
+    if (!user) {
+      showNotify("ログインが必要です", "error");
+      return;
+    }
+
+    try {
+      await addDoc(collection(db, 'artifacts', appId, 'public', 'data', 'shuttle_logs'), {
+        date,
+        category,
+        content,
+        createdAt: Timestamp.now(),
+        userId: user.uid
+      });
+      setContent('');
+      showNotify("日誌を記録しました！");
+    } catch (error) {
+      console.error("Save error:", error);
+      showNotify("保存に失敗しました", "error");
+    }
+  };
+
+  const handleDeleteClick = (id) => {
+    setDeleteId(id);
+  };
+
+  const executeDelete = async () => {
+    if (!deleteId) return;
+    try {
+      await deleteDoc(doc(db, 'artifacts', appId, 'public', 'data', 'shuttle_logs', deleteId));
+      showNotify("記録を削除しました");
+      setDeleteId(null);
+    } catch (error) {
+      console.error("Delete error:", error);
+      showNotify("削除に失敗しました", "error");
+    }
+  };
+
+  // --- Export Logic for NotebookLM ---
+  const generatedExportText = useMemo(() => {
+    let text = "# 送迎バス運行業務日誌データ\n\n";
+    text += "このデータはAIによる分析およびマニュアル作成のために出力されたものです。\n\n";
+    
+    logs.forEach(log => {
+      const categoryLabel = CATEGORIES.find(c => c.id === log.category)?.label || log.category;
+      text += `## 日付: ${log.date}\n`;
+      text += `カテゴリ: ${categoryLabel}\n`;
+      text += `内容:\n${log.content}\n\n`;
+      text += `---\n\n`;
+    });
+    return text;
+  }, [logs, CATEGORIES]);
+
+  const copyToClipboard = () => {
+    const textarea = document.createElement('textarea');
+    textarea.value = generatedExportText;
+    document.body.appendChild(textarea);
+    textarea.select();
+    document.execCommand('copy');
+    document.body.removeChild(textarea);
+    showNotify("クリップボードにコピーしました！NotebookLMに貼り付けてください。");
+  };
+
+  const downloadTxtFile = () => {
+    const element = document.createElement("a");
+    const file = new Blob([generatedExportText], {type: 'text/plain'});
+    element.href = URL.createObjectURL(file);
+    element.download = `shuttle_bus_logs_${new Date().toISOString().slice(0,10)}.txt`;
+    document.body.appendChild(element);
+    element.click();
+    document.body.removeChild(element);
+    showNotify("テキストファイルをダウンロードしました。");
+  };
+
+  return (
+    <div className="min-h-screen bg-slate-50 text-slate-800 font-sans pb-20">
+      <Notification 
+        message={notification.message} 
+        type={notification.type} 
+        onClose={() => setNotification({ message: '', type: '' })} 
+      />
+
+      {/* Delete Confirmation Modal */}
+      {deleteId && (
+        <div className="fixed inset-0 bg-black/50 z-50 flex items-center justify-center p-4 animate-fade-in">
+          <div className="bg-white rounded-xl shadow-lg max-w-sm w-full p-6">
+            <h3 className="text-lg font-bold text-slate-800 mb-2">記録を削除しますか？</h3>
+            <p className="text-sm text-slate-500 mb-6">この操作は取り消せません。</p>
+            <div className="flex gap-3">
+              <button 
+                onClick={() => setDeleteId(null)}
+                className="flex-1 py-2.5 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-lg font-bold text-sm"
+              >
+                キャンセル
+              </button>
+              <button 
+                onClick={executeDelete}
+                className="flex-1 py-2.5 bg-red-600 hover:bg-red-700 text-white rounded-lg font-bold text-sm"
+              >
+                削除する
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Header */}
+      <header className="bg-teal-700 text-white p-4 shadow-md sticky top-0 z-10">
+        <div className="max-w-2xl mx-auto flex justify-between items-center">
+          <div className="flex items-center gap-2">
+            <Bus className="h-6 w-6" />
+            <h1 className="text-xl font-bold tracking-wide">送迎バス運行日誌</h1>
+          </div>
+          <button 
+            onClick={() => setShowExport(!showExport)}
+            className="text-xs bg-teal-800 hover:bg-teal-900 py-1.5 px-3 rounded-full flex items-center gap-1 transition-colors"
+          >
+            <FileText size={14} />
+            {showExport ? '入力へ戻る' : '出力モード'}
+          </button>
+        </div>
+      </header>
+
+      <main className="max-w-2xl mx-auto p-4">
+        
+        {/* VIEW: EXPORT MODE */}
+        {showExport ? (
+          <div className="animate-fade-in">
+            <div className="bg-white rounded-xl shadow-sm p-6 mb-6 border border-slate-200">
+              <h2 className="text-lg font-bold mb-2 flex items-center gap-2 text-slate-700">
+                <FileText className="text-teal-600" />
+                NotebookLM用データ出力
+              </h2>
+              <p className="text-sm text-slate-500 mb-6">
+                蓄積されたデータをテキスト形式で出力します。NotebookLMのソースとして追加してください。
+              </p>
+
+              <div className="flex flex-col gap-3">
+                <button 
+                  onClick={copyToClipboard}
+                  className="w-full py-3 px-4 bg-blue-600 hover:bg-blue-700 text-white rounded-lg font-medium flex items-center justify-center gap-2 transition-all shadow-sm active:scale-95"
+                >
+                  <ClipboardCopy size={20} />
+                  テキストをコピー
+                </button>
+                <button 
+                  onClick={downloadTxtFile}
+                  className="w-full py-3 px-4 bg-white border-2 border-slate-200 hover:bg-slate-50 text-slate-700 rounded-lg font-medium flex items-center justify-center gap-2 transition-all active:scale-95"
+                >
+                  <Download size={20} />
+                  .txtファイルで保存
+                </button>
+              </div>
+
+              <div className="mt-6">
+                <label className="text-xs font-bold text-slate-400 uppercase mb-2 block">プレビュー</label>
+                <div className="bg-slate-100 p-4 rounded-lg text-xs font-mono text-slate-600 h-64 overflow-y-auto whitespace-pre-wrap border border-slate-200">
+                  {generatedExportText}
+                </div>
+              </div>
+            </div>
+          </div>
+        ) : (
+          /* VIEW: INPUT & LIST MODE */
+          <div className="animate-fade-in space-y-6">
+            
+            {/* Input Form */}
+            <div className="bg-white rounded-xl shadow-md p-5 border-l-4 border-teal-500">
+              <form onSubmit={handleSave} className="space-y-4">
+                <div className="flex gap-3">
+                  <div className="w-1/3">
+                    <label className="block text-xs font-bold text-slate-500 mb-1">日付</label>
+                    <input 
+                      type="date" 
+                      required
+                      value={date}
+                      onChange={(e) => setDate(e.target.value)}
+                      className="w-full p-2 bg-slate-50 border border-slate-200 rounded-lg focus:ring-2 focus:ring-teal-500 outline-none text-sm"
+                    />
+                  </div>
+                  <div className="w-2/3">
+                    <label className="block text-xs font-bold text-slate-500 mb-1">カテゴリ</label>
+                    <div className="relative">
+                      <select 
+                        value={category}
+                        onChange={(e) => setCategory(e.target.value)}
+                        className="w-full p-2 bg-slate-50 border border-slate-200 rounded-lg focus:ring-2 focus:ring-teal-500 outline-none text-sm appearance-none"
+                      >
+                        {CATEGORIES.map(cat => (
+                          <option key={cat.id} value={cat.id}>{cat.label}</option>
+                        ))}
+                      </select>
+                      <div className="absolute right-3 top-2.5 pointer-events-none text-slate-400">▼</div>
+                    </div>
+                  </div>
+                </div>
+
+                <div>
+                  <label className="block text-xs font-bold text-slate-500 mb-1">
+                    内容
+                    <span className="ml-2 font-normal text-slate-400 text-[10px]">※気づきや要望を具体的に</span>
+                  </label>
+                  <textarea 
+                    value={content}
+                    onChange={(e) => setContent(e.target.value)}
+                    placeholder="例：〇〇バス停付近で工事があり渋滞していた。15:00の便でお客様から「ありがとう」と感謝の言葉を頂いた。"
+                    className="w-full p-3 bg-slate-50 border border-slate-200 rounded-lg focus:ring-2 focus:ring-teal-500 outline-none text-sm min-h-[100px]"
+                  />
+                </div>
+
+                <button 
+                  type="submit" 
+                  className="w-full bg-teal-600 hover:bg-teal-700 text-white font-bold py-3 rounded-lg flex items-center justify-center gap-2 transition-all shadow-sm active:scale-95"
+                >
+                  <Save size={18} />
+                  記録する
+                </button>
+              </form>
+            </div>
+
+            {/* History List */}
+            <div>
+              <h3 className="text-sm font-bold text-slate-500 mb-3 px-1">最近の記録 ({logs.length}件)</h3>
+              
+              {loading ? (
+                <div className="text-center py-10 text-slate-400">読み込み中...</div>
+              ) : logs.length === 0 ? (
+                <div className="bg-white p-8 rounded-xl shadow-sm text-center text-slate-400 border border-dashed border-slate-300">
+                  <Bus className="mx-auto mb-2 opacity-50" />
+                  <p>まだ記録がありません。<br />最初の業務記録を追加しましょう！</p>
+                </div>
+              ) : (
+                <div className="space-y-3">
+                  {logs.map(log => {
+                    const cat = CATEGORIES.find(c => c.id === log.category) || CATEGORIES[3];
+                    return (
+                      <div key={log.id} className="bg-white p-4 rounded-xl shadow-sm border border-slate-100 relative group">
+                        <div className="flex justify-between items-start mb-2">
+                          <div className="flex items-center gap-2">
+                            <span className="text-xs font-mono font-bold text-slate-400 bg-slate-100 px-2 py-0.5 rounded">
+                              {log.date}
+                            </span>
+                            <span className={`text-[10px] font-bold px-2 py-0.5 rounded-full flex items-center gap-1 ${cat.color}`}>
+                              {cat.icon}
+                              {cat.label}
+                            </span>
+                          </div>
+                          <button 
+                            onClick={() => handleDeleteClick(log.id)}
+                            className="text-slate-300 hover:text-red-400 p-1 rounded transition-colors"
+                          >
+                            <Trash2 size={14} />
+                          </button>
+                        </div>
+                        <p className="text-sm text-slate-700 whitespace-pre-wrap leading-relaxed">
+                          {log.content}
+                        </p>
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+            </div>
+          </div>
+        )}
+      </main>
+    </div>
+  );
+}
